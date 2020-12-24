@@ -1,80 +1,109 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"github.com/go-kit/kit/log"
-	"github.com/microservices-demo/payment"
-	stdopentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
-	"golang.org/x/net/context"
+	"github.com/sls-microservices-demo/payment"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp"
+	"go.opentelemetry.io/otel/exporters/stdout"
+	"go.opentelemetry.io/otel/propagation"
+	export "go.opentelemetry.io/otel/sdk/export/trace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/semconv"
 )
 
 const (
 	ServiceName = "payment"
 )
 
+// Log domain.
+var logger log.Logger
+var otlpEndpoint string
+
+var (
+	port          = flag.String("port", "8080", "Port to bind HTTP listener")
+	zip           = flag.String("zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
+	declineAmount = flag.Float64("decline", 105, "Decline payments over certain amount")
+)
+
+func init() {
+	flag.StringVar(&otlpEndpoint, "otlp-endpoint", os.Getenv("OTLP_ENDPOINT"), "otlp endpoint")
+}
+
+func initTracer() {
+
+	var traceExporter export.SpanExporter
+
+	if otlpEndpoint == "stdout" {
+		// Create stdout exporter to be able to retrieve
+		// the collected spans.
+		exporter, err := stdout.NewExporter(stdout.WithPrettyPrint())
+		if err != nil {
+			panic(err)
+		}
+		logger.Log("register stdout exporter", "")
+		traceExporter = exporter
+	} else if otlpEndpoint != "" {
+		// If the OpenTelemetry Collector is running on a local cluster (minikube or
+		// microk8s), it should be accessible through the NodePort service at the
+		// `localhost:30080` address. Otherwise, replace `localhost` with the
+		// address of your cluster. If you run the app inside k8s, then you can
+		// probably connect directly to the service through dns
+		exp, err := otlp.NewExporter(context.Background(),
+			otlp.WithInsecure(),
+			otlp.WithAddress(otlpEndpoint),
+			//otlp.WithGRPCDialOption(grpc.WithBlock()), // useful for testing
+		)
+		if err != nil {
+			panic(err)
+		}
+		logger.Log("register otlp exporter", otlpEndpoint)
+		traceExporter = exp
+	}
+	if traceExporter == nil {
+		logger.Log("no opentelemetry exporter", "")
+		return
+	}
+
+	hostname, _ := os.Hostname()
+	// For the demonstration, use sdktrace.AlwaysSample sampler to sample all traces.
+	// In a production application, use sdktrace.ProbabilitySampler with a desired probability.
+	tp := sdktrace.NewTracerProvider(sdktrace.WithConfig(sdktrace.Config{DefaultSampler: sdktrace.AlwaysSample()}),
+		sdktrace.WithSyncer(traceExporter),
+		//sdktrace.WithSyncer(&TTE{}),
+		sdktrace.WithResource(resource.NewWithAttributes(semconv.ServiceNameKey.String("user"))),
+		sdktrace.WithResource(resource.NewWithAttributes(semconv.HostNameKey.String(hostname))))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+}
+
 func main() {
-	var (
-		port          = flag.String("port", "8080", "Port to bind HTTP listener")
-		zip           = flag.String("zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
-		declineAmount = flag.Float64("decline", 105, "Decline payments over certain amount")
-	)
+
 	flag.Parse()
-	var tracer stdopentracing.Tracer
 	{
 		// Log domain.
-		var logger log.Logger
 		{
 			logger = log.NewLogfmtLogger(os.Stderr)
-			logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC)
-			logger = log.NewContext(logger).With("caller", log.DefaultCaller)
+			logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+			logger = log.With(logger, "caller", log.DefaultCaller)
 		}
-		// Find service local IP.
-		conn, err := net.Dial("udp", "8.8.8.8:80")
-		if err != nil {
-			logger.Log("err", err)
-			os.Exit(1)
-		}
-		localAddr := conn.LocalAddr().(*net.UDPAddr)
-		host := strings.Split(localAddr.String(), ":")[0]
-		defer conn.Close()
-		if *zip == "" {
-			tracer = stdopentracing.NoopTracer{}
-		} else {
-			logger := log.NewContext(logger).With("tracer", "Zipkin")
-			logger.Log("addr", zip)
-			collector, err := zipkin.NewHTTPCollector(
-				*zip,
-				zipkin.HTTPLogger(logger),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-			tracer, err = zipkin.NewTracer(
-				zipkin.NewRecorder(collector, false, fmt.Sprintf("%v:%v", host, port), ServiceName),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-		}
-		stdopentracing.InitGlobalTracer(tracer)
+		initTracer()
 
 	}
 	// Mechanical stuff.
 	errc := make(chan error)
 	ctx := context.Background()
 
-	handler, logger := payment.WireUp(ctx, float32(*declineAmount), tracer, ServiceName)
+	handler, logger := payment.WireUp(ctx, float32(*declineAmount), ServiceName)
 
 	// Create and launch the HTTP server.
 	go func() {

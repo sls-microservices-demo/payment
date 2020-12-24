@@ -1,11 +1,10 @@
-FROM golang:1.7
+FROM golang:1.15
 
-COPY . /go/src/github.com/microservices-demo/payment/
+COPY . /go/src/github.com/sls-microservices-demo/payment/
 
-RUN go get -u github.com/FiloSottile/gvt
-RUN cd /go/src/github.com/microservices-demo/payment/ && gvt restore
+RUN cd /go/src/github.com/sls-microservices-demo/payment/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app github.com/microservices-demo/payment/cmd/paymentsvc
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /app github.com/sls-microservices-demo/payment/cmd/paymentsvc
 
 FROM alpine:3.4
 
@@ -24,6 +23,6 @@ RUN	addgroup -g ${SERVICE_GID} ${SERVICE_GROUP} && \
 
 USER ${SERVICE_USER}
 
-CMD ["/app", "-port=8080"]
+CMD ["/app", "-port=80"]
 
-EXPOSE 8080
+EXPOSE 80
